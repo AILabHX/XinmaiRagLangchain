@@ -15,7 +15,7 @@ import uuid
 import numpy as np
 from tools import pdfSplitTest_Ch
 from tools import pdfSplitTest_En
-
+import os
 
 # 设置日志模版
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -27,11 +27,11 @@ API_TYPE = "oneapi"  # openai:调用gpt模型；oneapi:调用oneapi方案支持�
 
 # openai模型相关配置 根据自己的实际情况进行调整
 OPENAI_API_BASE = "https://api.wlai.vip/v1"
-OPENAI_EMBEDDING_API_KEY = "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"
+OPENAI_EMBEDDING_API_KEY = " "
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 # oneapi相关配置(通义千问为例) 根据自己的实际情况进行调整
-ONEAPI_API_BASE = "http://172.16.12.45:3000/v1"
-ONEAPI_EMBEDDING_API_KEY = "sk-fS4eyjgqWJFK3U9z7fD01440262649A0A076A50859Cd5516"
+ONEAPI_API_BASE = os.getenv("ONEAPI_API_BASE")
+ONEAPI_EMBEDDING_API_KEY = os.getenv("ONEAPI_KEY")
 ONEAPI_EMBEDDING_MODEL = "text-embedding-v1"
 
 # 设置测试文本类型
@@ -61,7 +61,7 @@ def get_embeddings(texts):
                 api_key=ONEAPI_EMBEDDING_API_KEY
             )
             data = client.embeddings.create(input=texts,model=ONEAPI_EMBEDDING_MODEL).data
-            return [x.embedding for x in data]
+            return [x.embedding for x in data]#返回文本转成的向量
         except Exception as e:
             logger.info(f"生成向量时出错: {e}")
             return []
@@ -118,7 +118,7 @@ class MyVectorDBConnector:
     # 检索向量数据库，返回包含查询结果的对象或列表，这些结果包括最相似的向量及其相关信息
     # query：查询文本
     # top_n：返回与查询向量最相似的前 n 个向量
-    def search(self, query, top_n):
+    def  search(self, query, top_n):
         try:
             results = self.collection.query(
                 # 计算查询文本的向量，然后将查询文本生成的向量在向量数据库中进行相似度检索

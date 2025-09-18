@@ -20,3 +20,8 @@ other/models/"other/models/"
 "*.downloading" 
 "other/models/" 
 "*.downloading" 
+
+.env
+!.env.template  
+
+echo "chromaDB/" >> .gitignore

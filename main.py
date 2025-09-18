@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 # 向量数据库chromaDB设置相关 根据自己的实际情况进行调整
-CHROMADB_DIRECTORY = "chromaDB"  # chromaDB向量数据库的持久化路径
+CHROMADB_DIRECTORY = os.getenv("CHROMADB_DIRECTORY")  # chromaDB向量数据库的持久化路径
 CHROMADB_COLLECTION_NAME = "demo001"  # 待查询的chromaDB向量数据库的集合名称
 
 # prompt模版设置相关 根据自己的实际情况进行调整
@@ -55,7 +55,7 @@ OPENAI_CHAT_MODEL = "gpt-4o-mini"
 OPENAI_EMBEDDING_API_KEY = ""
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 # oneapi相关配置(通义千问为例) 根据自己的实际情况进行调整
-ONEAPI_API_BASE = "http://172.16.12.45:3000/v1"
+ONEAPI_API_BASE = os.getenv("ONEAPI_API_BASE")
 ONEAPI_CHAT_API_KEY = os.getenv("ONEAPI_KEY")
 ONEAPI_CHAT_MODEL = "qwen-plus"
 ONEAPI_EMBEDDING_API_KEY = os.getenv("ONEAPI_KEY")

@@ -137,7 +137,7 @@ def send_message(sessionId):
         ai_message_id = str(uuid.uuid4())[:8]  # 生成简短ID
         
         # 准备LLM API请求数据（严格按照apiMemoryTest.py格式）
-        llm_url = "http://localhost:8013/v1/chat/completions"
+        llm_url = "http://47.109.103.76:8013/v1/chat/completions"
         llm_headers = {"Content-Type": "application/json"}
         llm_data = {
             "messages": [{"role": "user", "content": dto.content}],
