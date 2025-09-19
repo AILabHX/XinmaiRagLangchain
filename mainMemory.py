@@ -12,6 +12,10 @@ import uuid
 import time
 import logging
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+# 加载.env文件中的环境变量
+load_dotenv()
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 from langchain_openai import ChatOpenAI
