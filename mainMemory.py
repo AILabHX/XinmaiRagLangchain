@@ -1,8 +1,5 @@
-# 功能说明：实现使用langchain框架，使用LCEL构建一个完整的LLM应用程序用于RAG知识库的查询，并使用fastapi进行发布
-# 包含：langchain框架的使用，langsmith跟踪检测
-
-# 相关依赖库
-# pip install langchain langchain-openai langchain-chroma
+# 功能说明：使用dify chatflow API构建RAG知识库查询应用，使用fastapi进行发布
+# 简化版本：移除LangChain依赖，直接调用dify API
 
 import os
 import re
@@ -11,82 +8,30 @@ import asyncio
 import uuid
 import time
 import logging
+import httpx
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
 # 加载.env文件中的环境变量
 load_dotenv()
+
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
-from langchain_openai import ChatOpenAI
-# prompt模版
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.prompts import PromptTemplate
-# 部署REST API相关
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
-# 向量数据库chroma相关
-from langchain_chroma import Chroma
-# openai的向量模型
-from langchain_openai import OpenAIEmbeddings
-# RAG相关
-from langchain_core.runnables import RunnablePassthrough
-
-# 配置可配置字段
-from langchain_core.runnables import ConfigurableFieldSpec
-# 定义聊天提示模板，以及占位符替换
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-# 用于运行带有消息历史的可运行对象
-from langchain_core.runnables.history import RunnableWithMessageHistory
-# 用于处理和存储对话历史
-from langchain_community.chat_message_histories import SQLChatMessageHistory
-
-
-
-# 设置langsmith环境变量
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_API_KEY"] = "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"
 
 # 设置日志模版
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# dify相关配置
+DIFY_API_BASE = "http://192.168.96.1/v1"  # dify服务地址
+DIFY_API_KEY = os.getenv("DIFY_API_KEY")  # dify API密钥
+DIFY_CHAT_ENDPOINT = "/chat-messages"
 
-# 向量数据库chromaDB设置相关 根据自己的实际情况进行调整
-CHROMADB_DIRECTORY = "chromaDB"  # chromaDB向量数据库的持久化路径
-CHROMADB_COLLECTION_NAME = "demo001"  # 待查询的chromaDB向量数据库的集合名称
-
-# prompt模版设置相关 根据自己的实际情况进行调整
-PROMPT_TEMPLATE_TXT = "prompt_template_memory.txt"
-
-# 模型设置相关  根据自己的实际情况进行调整
-API_TYPE = "oneapi"  # openai:调用gpt模型；oneapi:调用oneapi方案支持的模型(这里调用通义千问)
-# openai模型相关配置 根据自己的实际情况进行调整
-OPENAI_API_BASE = "https://api.wlai.vip/v1"
-OPENAI_CHAT_API_KEY = "sk-EhxvNWXkjzZJADfHA1Ac24Dd0f0b42B2B97f3725D3BcA378"
-OPENAI_CHAT_MODEL = "gpt-4o-mini"
-OPENAI_EMBEDDING_API_KEY = "sk-EhxvNWXkjzZJADfHA1Ac24Dd0f0b42B2B97f3725D3BcA378"
-OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
-# oneapi相关配置
-ONEAPI_API_BASE = "http://localhost:3000/v1"
-ONEAPI_CHAT_API_KEY = "sk-sCJmhXK1NmNNO86qB5Cd2aC1E07940Db9253E72167719047"
-ONEAPI_CHAT_MODEL = "qwen-plus"
-ONEAPI_EMBEDDING_API_KEY = "sk-sCJmhXK1NmNNO86qB5Cd2aC1E07940Db9253E72167719047"
-ONEAPI_EMBEDDING_MODEL = "text-embedding-v1"
-
-# API服务设置相关  根据自己的实际情况进行调整
+# API服务设置相关
 PORT = 8013  # 服务访问的端口
-
-# 申明全局变量 全局调用
-# query_content = ''   # 将chain中传递的用户输入的信息赋值到query_content
-model = None  # 使用的LLM模型
-embeddings = None  # 使用的Embedding模型
-vectorstore = None  # 向量数据库实例
-prompt = None  # prompt内容
-chain = None  # 定义的chain
-
-
 
 # 定义Message类
 class Message(BaseModel):
@@ -99,6 +44,8 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     userId: Optional[str] = None
     conversationId: Optional[str] = None
+    user: Optional[str] = None  # 兼容user字段
+    conversation_id: Optional[str] = None  # 兼容conversation_id字段
 
 # 定义ChatCompletionResponseChoice类
 class ChatCompletionResponseChoice(BaseModel):
@@ -115,17 +62,115 @@ class ChatCompletionResponse(BaseModel):
     system_fingerprint: Optional[str] = None
 
 
-# 获取对话历史
-# 根据用户ID和会话ID获取SQL数据库中的聊天历史
-# 该函数返回一个SQLChatMessageHistory对象，用于存储特定用户和会话的历史记录
-def get_session_history(user_id: str, conversation_id: str):
-    return SQLChatMessageHistory(f"{user_id}--{conversation_id}", "sqlite:///memory.db")
+async def call_dify_api(query: str, conversation_id: str = None, user_id: str = None, stream: bool = False):
+    """调用dify chatflow API，让dify处理所有RAG功能"""
+    if not DIFY_API_KEY:
+        raise HTTPException(status_code=500, detail="DIFY_API_KEY未配置")
+    
+    headers = {
+        "Authorization": f"Bearer {DIFY_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    # 验证conversation_id是否为有效的UUID格式
+    if conversation_id and conversation_id.strip():
+        try:
+            uuid.UUID(conversation_id)
+        except ValueError:
+            # 如果不是有效的UUID，设置为空字符串
+            conversation_id = ""
+    
+    payload = {
+        "inputs": {},  # 不需要传递context，dify会自己检索知识库
+        "query": query,
+        "response_mode": "streaming" if stream else "blocking",
+        "conversation_id": conversation_id or "",
+        "user": user_id or "default_user"
+    }
+    
+    logger.info(f"调用dify API，请求参数: {payload}")
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{DIFY_API_BASE}{DIFY_CHAT_ENDPOINT}",
+                headers=headers,
+                json=payload,
+                timeout=30.0
+            )
+            
+            # 记录响应状态和内容
+            logger.info(f"dify API响应状态码: {response.status_code}")
+            logger.info(f"dify API响应头: {dict(response.headers)}")
+            logger.info(f"dify API原始响应内容: {response.text}")
+            
+            response.raise_for_status()
+            
+            # 检查响应内容是否为空
+            if not response.text or response.text.strip() == "":
+                logger.error("dify API返回空响应")
+                raise HTTPException(status_code=500, detail="dify API返回空响应")
+            
+            # 改进JSON解析，处理可能的响应格式问题
+            try:
+                result = response.json()
+                logger.info(f"dify API JSON解析成功: {result}")
+                return result
+            except json.JSONDecodeError as json_error:
+                logger.error(f"dify API响应JSON解析失败: {str(json_error)}")
+                logger.error(f"原始响应内容: {repr(response.text)}")
+                raise HTTPException(status_code=500, detail=f"dify API响应格式错误: {str(json_error)}")
+                
+    except httpx.TimeoutException:
+        logger.error("dify API请求超时")
+        raise HTTPException(status_code=504, detail="dify API请求超时")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"dify API HTTP错误: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"dify API错误: {e.response.text}")
+    except Exception as e:
+        logger.error(f"调用dify API时出错: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"调用dify API失败: {str(e)}")
 
 
-# 获取prompt在chain中传递的prompt最终的内容
-def getPrompt(prompt):
-    logger.info(f"最后给到LLM的prompt的内容: {prompt}")
-    return prompt
+async def generate_dify_stream(dify_response):
+    """处理dify的流式响应"""
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+    
+    # 从dify响应中获取回答内容
+    answer = dify_response.get("answer", "")
+    lines = answer.split('\n')
+    
+    for i, line in enumerate(lines):
+        if line.strip():  # 只发送非空行
+            chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": line + '\n'},
+                        "finish_reason": None
+                    }
+                ]
+            }
+            yield f"{json.dumps(chunk)}\n"
+            await asyncio.sleep(0.05)  # 控制流式响应速度
+    
+    # 结束标记
+    final_chunk = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }
+        ]
+    }
+    yield f"{json.dumps(final_chunk)}\n"
 
 
 # 格式化响应，对输入的文本进行段落分隔、添加适当的换行符，以及在代码块中增加标记，以便生成更具可读性的输出
@@ -158,134 +203,21 @@ def format_response(response):
 
 
 # 定义了一个异步函数 lifespan，它接收一个FastAPI应用实例app作为参数。这个函数将管理应用的生命周期，包括启动和关闭时的操作
-# 函数在应用启动时执行一些初始化操作，如设置搜索引擎、加载上下文数据、以及初始化问题生成器
-# 函数在应用关闭时执行一些清理操作
-# @asynccontextmanager 装饰器用于创建一个异步上下文管理器，它允许你在 yield 之前和之后执行特定的代码块，分别表示启动和关闭时的操作
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时执行
-    # 申明引用全局变量，在函数中被初始化，并在整个应用中使用
-    global model, embeddings, vectorstore, prompt, chain, API_TYPE, CHROMADB_DIRECTORY, CHROMADB_COLLECTION_NAME, PROMPT_TEMPLATE_TXT, with_message_history
-    global ONEAPI_API_BASE, ONEAPI_CHAT_API_KEY, ONEAPI_CHAT_MODEL, ONEAPI_EMBEDDING_API_KEY, ONEAPI_EMBEDDING_MODEL
-    global OPENAI_API_BASE, OPENAI_CHAT_API_KEY, OPENAI_CHAT_MODEL, OPENAI_EMBEDDING_API_KEY, OPENAI_EMBEDDING_MODEL
-    # 根据自己实际情况选择调用model和embedding模型类型
-    try:
-        logger.info("正在初始化模型、实例化Chroma对象、提取prompt模版、定义chain...")
-        # （1）根据API_TYPE选择初始化对应的模型
-        if API_TYPE == "oneapi":
-            # 实例化一个oneapi客户端对象
-            model = ChatOpenAI(
-                base_url=ONEAPI_API_BASE,
-                api_key=ONEAPI_CHAT_API_KEY,
-                model=ONEAPI_CHAT_MODEL,  # 本次使用的模型
-                # temperature=0,# 发散的程度，一般为0
-                # timeout=None,# 服务请求超时
-                # max_retries=2,# 失败重试最大次数
-            )
-            # 实例化embeddings处理模型
-            embeddings = OpenAIEmbeddings(
-                base_url=ONEAPI_API_BASE,
-                api_key=ONEAPI_EMBEDDING_API_KEY,
-                model=ONEAPI_EMBEDDING_MODEL,
-                deployment=ONEAPI_EMBEDDING_MODEL
-            )
-        elif API_TYPE == "openai":
-            # 实例化一个ChatOpenAI客户端对象
-            model = ChatOpenAI(
-                base_url=OPENAI_API_BASE,# 请求的API服务地址
-                api_key=OPENAI_CHAT_API_KEY,# API Key
-                model=OPENAI_CHAT_MODEL,# 本次使用的模型
-                # temperature=0,# 发散的程度，一般为0
-                # timeout=None,# 服务请求超时
-                # max_retries=2,# 失败重试最大次数
-            )
-            # 实例化embeddings处理模型
-            embeddings = OpenAIEmbeddings(
-                base_url=OPENAI_API_BASE,# 请求的API服务地址
-                api_key=OPENAI_EMBEDDING_API_KEY,# API Key
-                model=OPENAI_EMBEDDING_MODEL,
-                )
-
-        # （2）实例化Chroma对象
-        # 根据自己的实际情况调整persist_directory和collection_name
-        vectorstore = Chroma(persist_directory=CHROMADB_DIRECTORY,
-                             collection_name=CHROMADB_COLLECTION_NAME,
-                             embedding_function=embeddings,
-                             )
-        # （3）提取prompt模版
-        prompt_template = PromptTemplate.from_file(PROMPT_TEMPLATE_TXT, encoding="utf-8")
-        # 测试返回的prompt_template对象中提取template的内容
-        # logger.info(f"prompt_template的内容: {prompt_template.template}\n")
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system","你是一位专业的健康评估师，具备深厚的医学知识和数据分析能力。你的任务是根据用户提问，依照真实、专业、全面、可靠的医学知识回答。若用户提问表达宽泛，你必须根据专业临床知识进行有效、准确提问。在尽量少的问题轮数下收集全面的用户状态，最后依照真实、专业、可靠的医学知识，给出回答。"),
-                MessagesPlaceholder(variable_name="history"),#使用消息占位符 插入历史消息
-                ("human", prompt_template.template)
-            ]
-        )
-
-        # （4）定义chain
-        # 将RAG检索放到LangChain的LCEL的chain中执行
-        # 这段代码是使用Langchain框架中的`as_retriever`方法创建一个检索器对象
-        # LangChain VectorStore对象不是 Runnable 的子类，因此无法集成到LangChain的LCEL的chain中
-        # LangChain Retrievers是Runnable，实现了一组标准方法可集成到LCEL的chain中
-        # `vectorstore`是一个向量存储对象，用于存储和检索文本数据
-        # `as_retriever`方法将向量存储对象转换为一个检索器对象，该对象可以用于搜索与给定查询最相似的文本
-        # `search_type`参数设置为"similarity"，表示使用相似度搜索算法
-        # `search_kwargs`参数是一个字典，包含搜索算法的参数，这里的`k`参数设置为5，表示只返回与查询最相似的5个结果
-        # retriever = vectorstore.as_retriever(
-        #     search_type="similarity",
-        #     search_kwargs={"k": 3},
-        # )
-        # 定义chain
-        # 先构建prompt模版，将用户输入消息直接赋值给prompt模版中的{query}
-        # retriever返回值赋值给prompt模版中的{context}
-        # 原：将完整的prompt给到model执行
-        # chain = {
-        #             "query": RunnablePassthrough(),
-        #             "context": retriever
-        #         } | prompt | getPrompt | model
-
-        # 调整为如下
-        chain = prompt | getPrompt | model
-        logger.info("初始化完成")
-
-        #  处理带有消息历史Chain  将可运行的链与消息历史记录功能结合
-        # RunnableWithMessageHistory允许在运行链时携带消息历史
-        # 实例化的with_message_history是一个配置了消息历史的可运行对象，使用get_session_history来获取历史记录
-        # ConfigurableFieldSpec定义了用户ID和会话ID的配置字段，使得这些字段在运行时可以被动态传递
-        with_message_history = RunnableWithMessageHistory(
-            chain,
-            get_session_history,
-            input_messages_key="query",
-            history_messages_key="history",
-            history_factory_config=[
-                ConfigurableFieldSpec(
-                    id="user_id",
-                    annotation=str,
-                    name="User ID",
-                    description="Unique identifier for the user.",
-                    default="",
-                    is_shared=True,
-                ),
-                ConfigurableFieldSpec(
-                    id="conversation_id",
-                    annotation=str,
-                    name="Conversation ID",
-                    description="Unique identifier for the conversation.",
-                    default="",
-                    is_shared=True,
-                ),
-            ],
-        )
-    except Exception as e:
-        logger.error(f"初始化过程中出错: {str(e)}")
-        # raise 关键字重新抛出异常，以确保程序不会在错误状态下继续运行
-        raise
-
+    logger.info("正在初始化服务...")
+    
+    # 验证dify配置
+    if not DIFY_API_KEY or DIFY_API_KEY == "your_dify_api_key_here":
+        logger.error("DIFY_API_KEY未配置或为默认值，请在.env文件中设置正确的DIFY_API_KEY")
+        raise Exception("DIFY_API_KEY未正确配置")
+    
+    logger.info("服务初始化完成")
+    
     # yield 关键字将控制权交还给FastAPI框架，使应用开始运行
-    # 分隔了启动和关闭的逻辑。在yield 之前的代码在应用启动时运行，yield 之后的代码在应用关闭时运行
     yield
+    
     # 关闭时执行
     logger.info("正在关闭...")
 
@@ -294,82 +226,39 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-# POST请求接口，与大模型进行知识问答
+# POST请求接口，与dify chatflow进行知识问答
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    # 申明引用全局变量，在函数中被初始化，并在整个应用中使用
-    if not model or not embeddings or not vectorstore or not prompt or not chain:
-        logger.error("服务未初始化")
-        raise HTTPException(status_code=500, detail="服务未初始化")
-
+    logger.info(f"前端原始请求: {request.model_dump()}")
+    
     try:
-        logger.info(f"收到聊天完成请求: {request}")
+        logger.info(f"收到聊天完成请求")
         query_prompt = request.messages[-1].content
         logger.info(f"用户问题是: {query_prompt}")
-
-        # 进行本地知识库检索，retriever返回向量数据库中查询的数据
-        retriever = vectorstore.similarity_search(
+        
+        # 处理不同的参数名称格式，兼容多种请求格式
+        user_id = request.userId or request.user or "default_user"
+        conversation_id = request.conversationId or request.conversation_id or ""
+        
+        logger.info(f"处理后的参数 - user_id: {user_id}, conversation_id: {conversation_id}")
+        
+        # 直接调用dify API，不再进行本地向量检索
+        logger.info(f"开始调用 dify API...")
+        dify_response = await call_dify_api(
             query=query_prompt,
-            k=3,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            stream=request.stream
         )
-
-        # 调用chain进行查询
-        result = with_message_history.invoke(
-            {"query": query_prompt,"context": retriever},#把向量库的知识retriever放进prompt中的{context}
-            config={"configurable": {"user_id": request.userId, "conversation_id": request.conversationId}}
-        )
-
-        formatted_response = str(format_response(result.content))
-        logger.info(f"格式化的搜索结果: {formatted_response}")
-
-        # 处理流式响应
+        logger.info(f"dify API 调用成功")
+        
+        # 处理响应
         if request.stream:
-            # 定义一个异步生成器函数，用于生成流式数据
-            async def generate_stream():
-                # 为每个流式数据片段生成一个唯一的chunk_id
-                chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
-                # 将格式化后的响应按行分割
-                lines = formatted_response.split('\n')
-                # 历每一行，并构建响应片段
-                for i, line in enumerate(lines):
-                    # 创建一个字典，表示流式数据的一个片段
-                    chunk = {
-                        "id": chunk_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        # "model": request.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": line + '\n'}, # if i > 0 else {"role": "assistant", "content": ""},
-                                "finish_reason": None
-                            }
-                        ]
-                    }
-                    # 将片段转换为JSON格式并生成
-                    yield f"{json.dumps(chunk)}\n"
-                    # 每次生成数据后，异步等待0.5秒
-                    await asyncio.sleep(0.5)
-                # 生成最后一个片段，表示流式响应的结束
-                final_chunk = {
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop"
-                        }
-                    ]
-                }
-                yield f"{json.dumps(final_chunk)}\n"
-
-            # 返回fastapi.responses中StreamingResponse对象，流式传输数据
-            # media_type设置为text/event-stream以符合SSE(Server-SentEvents) 格式
-            return StreamingResponse(generate_stream(), media_type="text/event-stream")
-        # 处理非流式响应处理
+            return StreamingResponse(generate_dify_stream(dify_response), media_type="text/event-stream")
         else:
+            answer = dify_response.get("answer", "")
+            formatted_response = format_response(answer)
+            
             response = ChatCompletionResponse(
                 choices=[
                     ChatCompletionResponseChoice(
@@ -379,14 +268,21 @@ async def chat_completions(request: ChatCompletionRequest):
                     )
                 ]
             )
-            logger.info(f"发送响应内容: \n{response}")
-            # 返回fastapi.responses中JSONResponse对象
-            # model_dump()方法通常用于将Pydantic模型实例的内容转换为一个标准的Python字典，以便进行序列化
+            logger.info(f"发送响应内容")
             return JSONResponse(content=response.model_dump())
+            
+    except HTTPException:
+        # 重新抛出HTTP异常
+        raise
     except Exception as e:
-        logger.error(f"处理聊天完成时出错:\n\n {str(e)}")
+        logger.error(f"处理聊天完成时出错: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/health")
+async def health_check():
+    """健康检查接口"""
+    return {"status": "healthy", "service": "dify-chatflow-api"}
 
 
 if __name__ == "__main__":
@@ -394,5 +290,3 @@ if __name__ == "__main__":
     # uvicorn是一个用于运行ASGI应用的轻量级、超快速的ASGI服务器实现
     # 用于部署基于FastAPI框架的异步PythonWeb应用程序
     uvicorn.run(app, host="0.0.0.0", port=PORT)
-
-

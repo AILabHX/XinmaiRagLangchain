@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  xinmai-rag:
+    build: .
+    container_name: xinmai-rag-app
+    ports:
+      - "5000:5000"   # apiMain.py 端口
+      - "8013:8013"   # mainMemory.py 端口
+    volumes:
+      - ./chromaDB:/app/chromaDB
+      - ./memory.db:/app/memory.db
+      - ./input:/app/input
+      - ./.env:/app/.env
+    environment:
+      - LANGCHAIN_TRACING_V2=true
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
+    restart: unless-stopped
+    stdin_open: true
+    tty: true

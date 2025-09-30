@@ -46,7 +46,7 @@ PAGE_NUMBERS=None
 
 # 指定向量数据库chromaDB的存储位置和集合 根据自己的实际情况进行调整
 CHROMADB_DIRECTORY = "chromaDB"  # chromaDB向量数据库的持久化路径
-CHROMADB_COLLECTION_NAME = "demo002"  # 待查询的chromaDB向量数据库的集合名称
+CHROMADB_COLLECTION_NAME = "demo002"  # 待查询的chromaDB向量数据库的集合名称，理解为MySQL的表
 # CHROMADB_COLLECTION_NAME = "demo002"  # 待查询的chromaDB向量数据库的集合名称
 
 
@@ -136,7 +136,7 @@ def vectorStoreSave():
     global TEXT_LANGUAGE, CHROMADB_COLLECTION_NAME, INPUT_PDF, PAGE_NUMBERS
     # 测试中文文本
     if TEXT_LANGUAGE == 'Chinese':
-        # 1、获取处理后的文本数据
+        # 1、获取处理后的切好的文本chunk
         # 演示测试对指定的全部页进行处理，其返回值为划分为段落的文本列表
         paragraphs = pdfSplitTest_Ch.getParagraphs(
             filename=INPUT_PDF,
