@@ -1,9 +1,8 @@
 import os
 import requests
 import logging
-from http import HTTPStatus
+import json
 from flask import Flask, request, jsonify
-from dashscope import Application
 # 导入Celery相关模块（异步任务核心）
 from celery import Celery
 from celery.result import AsyncResult
@@ -13,9 +12,9 @@ app = Flask(__name__)
 # 日志配置（保留原有逻辑）
 app.logger.setLevel(logging.INFO)
 
-# 1. 阿里云百炼配置（建议从环境变量读取，避免硬编码）
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-8ac6ce8ab2f24126b166604f97f0af81")
-BAILIAN_APP_ID = os.getenv("BAILIAN_APP_ID", "55a12bae78c94eedb494b301787bc833")
+# 1. AIFlowy配置（建议从环境变量读取，避免硬编码）
+AIFLOWY_API_BASE = os.getenv("AIFLOWY_API_BASE", "http://10.0.0.19:8080")
+AIFLOWY_WORKFLOW_ID = os.getenv("AIFLOWY_WORKFLOW_ID", "335639084029775872")
 
 # 2. Celery异步任务配置（使用Redis作为任务队列和结果存储）
 # Redis连接地址：默认本地Redis（无需密码），生产环境需配置密码和远程地址
@@ -46,7 +45,7 @@ def get_signed_oss_content(signed_url):
             timeout=15,
             headers={"User-Agent": "Flask-OSS-Client/1.0"}
         )
-        if response.status_code != HTTPStatus.OK:
+        if response.status_code != 200:
             app.logger.error(f"OSS访问失败，状态码: {response.status_code}, 响应: {response.text}")
             return None
         # 处理中文乱码
@@ -78,6 +77,60 @@ def get_local_file_content(file_path):
         app.logger.error(f"读取本地文件异常: {str(e)}")
         return None
 
+def preprocess_input_data(raw_data):
+    """预处理输入数据，确保usr_infor参数能正确处理"""
+    try:
+        app.logger.info(f"=== 开始数据预处理 ===")
+        app.logger.info(f"原始数据类型: {type(raw_data)}")
+        app.logger.info(f"原始数据长度: {len(str(raw_data))} 字符")
+        app.logger.info(f"原始数据预览: {str(raw_data)[:300]}...")
+        
+        # 确保数据是字符串格式
+        if not isinstance(raw_data, str):
+            raw_data = str(raw_data)
+        
+        # 去除外层引号（如果存在双重转义）
+        if raw_data.startswith('"') and raw_data.endswith('"'):
+            app.logger.info("检测到外层引号，进行去除")
+            raw_data = raw_data[1:-1]
+        
+        # 处理转义字符 - 将 \r\n 转换为实际的换行符
+        # 注意：这里要处理的是字符串中的转义序列，不是实际的字符
+        raw_data = raw_data.replace('\\r\\n', '\n').replace('\\r', '\n').replace('\\n', '\n')
+        
+        # 尝试解析为JSON并重新格式化
+        try:
+            parsed_data = json.loads(raw_data)
+            app.logger.info("成功解析为JSON，重新格式化")
+            # 重新格式化为紧凑的JSON字符串，去除不必要的空白字符
+            formatted_data = json.dumps(parsed_data, ensure_ascii=False, separators=(',', ':'))
+            app.logger.info(f"格式化后数据长度: {len(formatted_data)} 字符")
+            app.logger.info(f"格式化后数据预览: {formatted_data[:300]}...")
+            return formatted_data
+        except json.JSONDecodeError as e:
+            app.logger.info(f"不是有效的JSON格式: {str(e)}")
+            # 如果不是JSON，进行基本的文本清理
+            cleaned_data = raw_data.strip()
+            # 移除多余的空白字符，但保留基本的换行结构
+            cleaned_data = ' '.join(cleaned_data.split())
+            app.logger.info(f"文本清理后数据长度: {len(cleaned_data)} 字符")
+            
+            # 对于清理后的数据，再次尝试解析为JSON（处理格式化后的情况）
+            try:
+                parsed_data = json.loads(cleaned_data)
+                app.logger.info("清理后数据成功解析为JSON，重新格式化")
+                formatted_data = json.dumps(parsed_data, ensure_ascii=False, separators=(',', ':'))
+                app.logger.info(f"最终格式化数据长度: {len(formatted_data)} 字符")
+                return formatted_data
+            except json.JSONDecodeError:
+                app.logger.info("清理后数据仍不是有效的JSON格式，返回清理后的文本")
+                return cleaned_data
+            
+    except Exception as e:
+        app.logger.error(f"数据预处理失败: {str(e)}")
+        app.logger.info("返回原始数据")
+        return str(raw_data)  # 出错时返回原始数据
+
 def callback_frontend(unique_id):
     """回调前端接口，通知任务完成"""
     try:
@@ -101,6 +154,258 @@ def callback_frontend(unique_id):
     except Exception as e:
         app.logger.error(f"前端回调异常: {str(e)}")
         return False
+
+def call_aiflowy_workflow(prompt):
+    """调用AIFlowy工作流"""
+    try:
+        # 构建请求URL
+        url = f"{AIFLOWY_API_BASE}/api/v1/aiWorkflow/runningStream"
+        print(url)
+        
+        # 预处理输入数据
+        cleaned_prompt = preprocess_input_data(prompt)
+        
+        # 保持原有的payload格式不变
+        payload = {
+            "id": AIFLOWY_WORKFLOW_ID,
+            "variables": {
+                "usr_infor": cleaned_prompt  # 使用预处理后的数据
+            }
+        }
+        
+        app.logger.info(f"=== 开始调用AIFlowy工作流 ===")
+        app.logger.info(f"请求URL: {url}")
+        app.logger.info(f"工作流ID: {AIFLOWY_WORKFLOW_ID}")
+        app.logger.info(f"预处理后数据长度: {len(cleaned_prompt)} 字符")
+        app.logger.info(f"预处理后数据预览: {cleaned_prompt[:200]}...")
+        
+        # 发送POST请求
+        #response = requests.post(
+        #    url,
+        #    json=payload,
+        #    timeout=180,
+        #    headers={"Content-Type": "application/json"}
+        #)
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=(30, 600),  # 连接超时30秒，读取超时600秒(10分钟)
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            },
+            stream=True  # 启用流式响应
+        )
+        
+        app.logger.info(f"AIFlowy响应状态码: {response.status_code}")
+        app.logger.info(f"AIFlowy响应头: {dict(response.headers)}")
+        
+        if response.status_code == 200:
+            response_text = response.text
+            app.logger.info(f"AIFlowy响应长度: {len(response_text)} 字符")
+            app.logger.info(f"AIFlowy响应内容: {response_text[:1500]}...")  # 显示前1500字符
+            
+            # 检查响应是否为空
+            if not response_text or response_text.strip() == "":
+                app.logger.error("AIFlowy返回空响应")
+                return None
+            
+            # 检查响应是否包含SSE格式
+            if 'data:' in response_text:
+                app.logger.info("检测到SSE格式响应")
+            else:
+                app.logger.warning("未检测到SSE格式响应，可能是其他格式")
+            
+            return response_text
+        else:
+            app.logger.error(f"AIFlowy调用失败，状态码: {response.status_code}")
+            app.logger.error(f"AIFlowy错误响应: {response.text}")
+            return None
+            
+    except requests.exceptions.Timeout:
+        app.logger.error("AIFlowy调用超时")
+        return None
+    except requests.exceptions.ConnectionError:
+        app.logger.error("AIFlowy连接错误")
+        return None
+    except Exception as e:
+        app.logger.error(f"AIFlowy调用异常: {str(e)}")
+        app.logger.error(f"异常详情: {str(e)}", exc_info=True)
+        return None
+
+def handle_streaming_response(stream_response):
+    """处理AIFlowy的流式响应"""
+    try:
+        # 添加调试日志：打印原始响应
+        app.logger.info(f"=== 开始处理流式响应 ===")
+        app.logger.info(f"原始响应长度: {len(stream_response)} 字符")
+        app.logger.info(f"原始响应内容: {stream_response[:1000]}...")  # 增加到1000字符
+        
+        # 检查响应是否为空
+        if not stream_response or stream_response.strip() == "":
+            app.logger.error("流式响应为空")
+            return None
+        
+        # 解析SSE格式的流式数据
+        lines = stream_response.strip().split('\n')
+        final_result = None
+        parsed_lines = 0
+        all_results = []  # 收集所有可能的结果
+        
+        app.logger.info(f"解析到 {len(lines)} 行SSE数据")
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+                
+            app.logger.info(f"=== 处理第 {i+1} 行 ===")
+            app.logger.info(f"行内容: {line}")
+            
+            # 处理SSE格式的data:行
+            if line.startswith('data:'):
+                # 提取data后面的内容
+                data_content = line[5:].strip()  # 去掉'data:'前缀
+                app.logger.info(f"提取的data内容: {data_content}")
+                
+                # 跳过空行
+                if not data_content:
+                    app.logger.info("跳过空行")
+                    continue
+                
+                try:
+                    # 尝试解析JSON
+                    data_json = json.loads(data_content)
+                    parsed_lines += 1
+                    app.logger.info(f"成功解析JSON: {json.dumps(data_json, ensure_ascii=False)}")
+                    
+                    # 检查JSON结构 - 更详细的调试
+                    app.logger.info(f"JSON键列表: {list(data_json.keys())}")
+                    
+                    if 'content' in data_json:
+                        content = data_json['content']
+                        app.logger.info(f"content键内容: {list(content.keys())}")
+                        
+                        # 检查execResult - 最终结果
+                        if 'execResult' in content:
+                            app.logger.info("找到execResult字段")
+                            exec_result = content['execResult']
+                            app.logger.info(f"execResult键内容: {list(exec_result.keys())}")
+                            
+                            if 'output' in exec_result:
+                                final_result = exec_result['output']
+                                app.logger.info("=== 找到execResult中的最终结果 ===")
+                                app.logger.info(f"最终结果长度: {len(final_result)} 字符")
+                                app.logger.info(f"最终结果预览: {final_result[:300]}...")
+                                all_results.append(('execResult', final_result))
+                        
+                        # 检查res - 中间结果
+                        if 'res' in content:
+                            app.logger.info("找到res字段")
+                            res = content['res']
+                            app.logger.info(f"res键内容: {list(res.keys())}")
+                            
+                            if 'output' in res:
+                                intermediate_result = res['output']
+                                app.logger.info("=== 找到中间节点的输出结果 ===")
+                                app.logger.info(f"中间结果长度: {len(intermediate_result)} 字符")
+                                app.logger.info(f"中间结果预览: {intermediate_result[:300]}...")
+                                all_results.append(('res', intermediate_result))
+                        
+                        # 检查其他可能的输出字段
+                        for key in ['result', 'answer', 'response', 'data']:
+                            if key in content:
+                                app.logger.info(f"找到其他输出字段: {key}")
+                                other_result = content[key]
+                                if isinstance(other_result, str) and len(other_result) > 10:
+                                    app.logger.info(f"其他字段内容长度: {len(other_result)} 字符")
+                                    all_results.append((key, other_result))
+                    
+                    # 检查其他可能的顶级字段
+                    for key in ['result', 'output', 'answer', 'response']:
+                        if key in data_json:
+                            app.logger.info(f"找到顶级字段: {key}")
+                            top_result = data_json[key]
+                            if isinstance(top_result, str) and len(top_result) > 10:
+                                app.logger.info(f"顶级字段内容长度: {len(top_result)} 字符")
+                                all_results.append((f'top_{key}', top_result))
+                        
+                except json.JSONDecodeError as e:
+                    app.logger.info(f"JSON解析失败: {str(e)}")
+                    app.logger.info(f"无法解析的内容: {data_content}")
+                    # 尝试检查是否是其他格式
+                    if len(data_content) > 50 and ('{' in data_content or '}' in data_content):
+                        app.logger.info("内容包含JSON标记但解析失败，可能是格式问题")
+                    continue
+        
+        app.logger.info(f"=== SSE解析完成 ===")
+        app.logger.info(f"总共解析了 {parsed_lines} 行JSON数据")
+        app.logger.info(f"收集到的结果数量: {len(all_results)}")
+        
+        # 选择最佳结果
+        if all_results:
+            # 优先选择execResult的结果
+            exec_results = [result for source, result in all_results if source == 'execResult']
+            if exec_results:
+                final_result = exec_results[0]
+                app.logger.info("使用execResult中的结果作为最终结果")
+            else:
+                # 其次选择res的结果
+                res_results = [result for source, result in all_results if source == 'res']
+                if res_results:
+                    final_result = res_results[0]
+                    app.logger.info("使用res中的结果作为最终结果")
+                else:
+                    # 使用最后一个结果
+                    final_result = all_results[-1][1]
+                    app.logger.info(f"使用{all_results[-1][0]}中的结果作为最终结果")
+            
+            app.logger.info(f"选择的最终结果长度: {len(final_result)} 字符")
+            app.logger.info(f"选择的最终结果预览: {final_result[:300]}...")
+            
+            # 尝试解析和格式化结果
+            try:
+                app.logger.info("开始解析最终结果中的JSON字符串")
+                
+                # 如果final_result是字符串形式的JSON，解析它
+                if isinstance(final_result, str):
+                    # 检查是否是JSON格式
+                    if final_result.strip().startswith('{') and final_result.strip().endswith('}'):
+                        try:
+                            parsed_result = json.loads(final_result)
+                            formatted_result = json.dumps(parsed_result, ensure_ascii=False, indent=2)
+                            app.logger.info("成功解析并格式化JSON结果")
+                            app.logger.info(f"格式化结果长度: {len(formatted_result)} 字符")
+                            return formatted_result
+                        except json.JSONDecodeError:
+                            app.logger.info("最终结果不是有效的JSON字符串，直接返回")
+                            return final_result
+                    else:
+                        app.logger.info("最终结果不是JSON格式，直接返回")
+                        return final_result
+                else:
+                    # 如果是字典或其他类型，转换为JSON
+                    formatted_result = json.dumps(final_result, ensure_ascii=False, indent=2)
+                    app.logger.info("最终结果不是字符串，转换为JSON格式")
+                    return formatted_result
+                    
+            except Exception as e:
+                app.logger.error(f"结果格式化失败: {str(e)}")
+                app.logger.info("直接返回原始结果")
+                return final_result
+        else:
+            # 如果没有找到任何结果，记录详细警告并返回原始响应
+            app.logger.warning("未在流式响应中找到任何结果")
+            app.logger.warning(f"原始响应前2000字符: {stream_response[:2000]}")
+            app.logger.warning("返回原始响应")
+            return stream_response
+            
+    except Exception as e:
+        app.logger.error(f"处理流式响应异常: {str(e)}")
+        app.logger.error(f"异常详情: {str(e)}", exc_info=True)
+        return None
 
 
 # ---------------------- 异步任务（核心新增） ----------------------
@@ -141,26 +446,23 @@ def async_process_oss_data(self, signed_oss_url, unique_id):
         self.update_state(
             state="PROGRESS",
             meta={
-                "status": "OSS内容获取成功，开始调用智能体",
+                "status": "OSS内容获取成功，开始调用AIFlowy工作流",
                 "oss_url": signed_oss_url,
                 "step": 2,
                 "total_steps": 3
             }
         )
 
-        # 3. 调用阿里云百炼智能体（步骤3）
-        app.logger.info(f"[任务{self.request.id}] 开始调用阿里云百炼智能体")
-        agent_response = Application.call(
-            api_key=DASHSCOPE_API_KEY,
-            app_id=BAILIAN_APP_ID,
-            prompt=f"请分析处理以下数据并给出结果：\n{oss_content}",
-        )
+        # 3. 调用AIFlowy工作流（步骤3）
+        app.logger.info(f"[任务{self.request.id}] 开始调用AIFlowy工作流")
+        app.logger.info(f"**********oss_content内容是*************",oss_content)
+        agent_response = call_aiflowy_workflow(oss_content)
 
         # 更新任务状态（步骤3完成）
         self.update_state(
             state="PROGRESS",
             meta={
-                "status": "智能体调用完成，正在整理结果",
+                "status": "工作流调用完成，正在整理结果",
                 "oss_url": signed_oss_url,
                 "unique_id": unique_id,
                 "step": 3,
@@ -168,22 +470,33 @@ def async_process_oss_data(self, signed_oss_url, unique_id):
             }
         )
 
-        # 4. 处理智能体响应
-        if agent_response.status_code != HTTPStatus.OK:
-            app.logger.error(f"[任务{self.request.id}] 智能体调用失败: {agent_response.message}")
+        # 4. 处理工作流响应
+        if not agent_response:
+            app.logger.error(f"[任务{self.request.id}] AIFlowy工作流调用失败")
             return {
                 "success": False,
-                "message": f"智能体处理失败: {agent_response.message}",
-                "request_id": agent_response.request_id,
+                "message": "AIFlowy工作流处理失败",
                 "oss_url": signed_oss_url,
                 "unique_id": unique_id,
                 "result": None
             }
 
-        # 5. 处理成功，返回结果
+        # 5. 处理流式响应
+        processed_result = handle_streaming_response(agent_response)
+        if not processed_result:
+            app.logger.error(f"[任务{self.request.id}] 流式响应处理失败")
+            return {
+                "success": False,
+                "message": "流式响应处理失败",
+                "oss_url": signed_oss_url,
+                "unique_id": unique_id,
+                "result": None
+            }
+
+        # 6. 处理成功，返回结果
         app.logger.info(f"[任务{self.request.id}] 处理完成，结果已保存")
         
-        # 6. 回调前端接口
+        # 7. 回调前端接口
         if unique_id:
             callback_success = callback_frontend(unique_id)
             app.logger.info(f"[任务{self.request.id}] 前端回调结果: {'成功' if callback_success else '失败'}")
@@ -191,10 +504,9 @@ def async_process_oss_data(self, signed_oss_url, unique_id):
         return {
             "success": True,
             "message": "OSS数据处理成功",
-            "request_id": agent_response.request_id,
             "oss_url": signed_oss_url,
             "unique_id": unique_id,
-            "result": agent_response.output.text  # 智能体分析结果
+            "result": processed_result  # AIFlowy工作流分析结果
         }
 
     except Exception as e:
